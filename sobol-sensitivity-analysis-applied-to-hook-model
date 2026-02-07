@@ -1,0 +1,263 @@
+# 0) Instalar / cargar paquetes (siempre que falten)
+if (!requireNamespace("sensitivity", quietly = TRUE)) install.packages("sensitivity", repos = "https://cloud.r-project.org")
+if (!requireNamespace("deSolve", quietly = TRUE)) install.packages("deSolve", repos = "https://cloud.r-project.org")
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2", repos = "https://cloud.r-project.org")
+if (!requireNamespace("tidyr", quietly = TRUE)) install.packages("tidyr", repos = "https://cloud.r-project.org")
+if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr", repos = "https://cloud.r-project.org")
+
+library(sensitivity)
+library(deSolve)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# 0)
+Emax <- function(Dmax, log_DC50, n, C){ # describes degradation as a function of drug concentration (no "hook" effect -> conventional Emax model)
+  DC50 <- exp(log_DC50) # convert log parameter to actual parameter
+  D <- Dmax * (C^n/(C^n+DC50^n)) # degradation (D:=1-P)
+  return (D) # returns degradation, NOT P levels remaining (P=1-D)
+} # end of function "Emax"
+
+
+# 1)
+Hook <- function(Dmax, log_DC50, log_DCmax, C){ # describes degradation as a function of drug concentration (accounting for the "hook effect" -> name)
+  DC50 <- exp(log_DC50) # convert log parameter to actual parameter
+  DCmax <- exp(log_DCmax) # convert log parameter to actual parameter
+  D <- Dmax * (DC50 + DCmax^2/DC50 - 2*DCmax) / (DC50 + DCmax^2/DC50 - 4*DCmax + C + DCmax^2/C) # degradation (D:=1-P)
+  return (D) # returns degradation, NOT P levels remaining (P=1-D)
+} # end of function "Hook"
+# 2)
+Hook_fit <- function(P, C){ # fits data on P degradation to data on drug exposure -> returns an nls object
+  P <- P[!is.na(P)&!is.na(C)] # makes sure that there are no missing values
+  C <- C[!is.na(P)&!is.na(C)] # makes sure that there are no missing values
+  if (max(P)>2){ # checks whether P is given in percent (%)
+    P0 <- 100 # P0 (P levels in the absence of drug exposure) is set to 100 %
+  } else { # if P is not given in percent (%) then it must be given as a fraction (e.g. 0.5 instead of 50%)
+    P0 <- 1 # P0 (P levels in the absence of drug exposure) is set to 1
+  } # end of code determining the unit of P
+  Dmax_estimate <- mean(P0-min(P)) # estimate Dmax to obtain a starting value for fitting
+  DCmax_estimate <- mean(C[P==min(P)]) # estimate DCmax to obtain a starting value for fitting
+  DC50_estimate <- min(C[(P[C<DCmax_estimate]-(P0-(Dmax_estimate/2)))^2==min((P[C<DCmax_estimate]-(P0-(Dmax_estimate/2)))^2)]) # estimate DC50 to obtain a starting value for fitting
+
+  if (sum(P[C>=DCmax_estimate])/length(which(C>=DCmax_estimate))>(P0-Dmax_estimate)*1.05){ # checks, whether there is a "hook" effect
+    Hook_model <- nls(log(P)~log(P0_cor*(P0-Hook(Dmax, log_DC50, log_DCmax, C))), # the "Hook" function is about degradation & NOT about P levels remaining
+                      start=c(Dmax=Dmax_estimate, log_DC50=log(DC50_estimate), log_DCmax=log(DCmax_estimate), P0_cor=1),
+                      algorithm="port", lower=c(0, -Inf, -Inf, 0), upper=c(P0, Inf, Inf, Inf), control=c(warnOnly=TRUE)) # estimates for start values
+    return (Hook_model) # returns the fitted model (nls object)
+  } else { # if there is no "hook" effect, then the conventional (Emax) model is fitted
+    Emax_model <- nls(log(P)~log(P0_cor*(P0-Emax(Dmax, log_DC50, n, C))),
+                      start=c(Dmax=Dmax_estimate, log_DC50=log(DC50_estimate), n=1, P0_cor=1),
+                      algorithm="port", lower=c(0, -Inf, -Inf, 0), upper=c(P0, Inf, Inf, Inf), control=c(warnOnly=TRUE)) # estimates for start values
+    return (Emax_model)
+  }
+} # end of function "Hook_fit"
+
+# ---------------------------
+# 2) Valores experimentales representativos (PROTAC anti-BTK / CRBN)
+
+# - Elegido el ejemplo: PROTAC dirigido a BTK con ligasa CRBN (casos típicos en literatura)
+# - Valores representativos tomados como ejemplos coherentes con publicaciones (p. ej. Zorba et al., datos reportados en la literatura de PROTACs anti-BTK):
+#   - Dmax típico alto: 0.8 - 0.95 (80–95% degradación máxima observable)
+#   - DC50 típico (en nM): ejemplo 100 nM
+#   - DCmax típico (nM): ejemplo 3000 nM (concentración donde Dmax se alcanza)
+#   - P0_cor = 1 (control cercano a 100%)
+#   - parámetros cinéticos celulares: vida media del POI = 12 h -> k_base = ln(2)/12 = 0.0578 h^(-1)
+#   - k_drug (escala del efecto inducido) elegida representativa para dar dinámica observada: 0.5 (ajustable)
+# ---------------------------
+
+# Valores centrales
+valores_central <- list(
+  Dmax_c = 0.90,              # Máxima fracción degradable (90%)
+  DC50_c = 100,               # nM
+  DCmax_c = 3000,             # nM
+  P0_cor_c = 1.0              # Factor de corrección control (fracción)
+)
+
+# Convertir a las variables del modelo
+log_DC50_c <- log(valores_central$DC50_c)
+log_DCmax_c <- log(valores_central$DCmax_c)
+
+# Parámetros cinéticos fijos (basados en vida media ~12 h)
+fixed_pars <- list(
+  k_base = log(2) / 12,  # ~0.05776 h^-1 (vida media 12 h)
+  k_drug = 0.5,          # Factor de escala de degradación inducida
+  C_fixed = 1000         # Concentración fija nM para la simulación
+)
+
+# ---------------------------
+# 3) Parámetros a variar en el SA y sus rangos (min,max)
+#    Tomamos rangos amplios alrededor de valores representativos para capturar incertidumbre experimental
+# ---------------------------
+pars_to_vary <- c("Dmax", "log_DC50", "log_DCmax", "P0_cor")
+
+binf <- c(
+  Dmax = 0.3,               # Mínimo plausible (30% máxima degradación)
+  log_DC50 = log(1),        # DC50 entre 1 nM y ...
+  log_DCmax = log(1),       # DCmax mínimo 1 nM
+  P0_cor = 0.8              # corrección control entre 0.8 y 1.2
+)
+bsup <- c(
+  Dmax = 0.995,             # Casi 100% degradación posible
+  log_DC50 = log(10000),    # DC50 hasta 10,000 nM
+  log_DCmax = log(30000),   # DCmax hasta 30,000 nM
+  P0_cor = 1.2
+)
+
+# 4) Tiempos y condición inicial
+times <- seq(0, 50, by = 1)   # En horas
+state_init <- c(P = 1)        # P(0)=1 (fracción)
+
+# 5) Función ODE (deSolve) robusta
+deSolveProtac <- function(time, state, pars) {
+  p <- as.list(pars)
+  required <- c("Dmax", "log_DC50", "log_DCmax", "P0_cor", "C", "k_base", "k_drug")
+  miss <- setdiff(required, names(p))
+  if (length(miss) > 0) stop("Faltan parámetros en 'pars': ", paste(miss, collapse = ", "))
+  # Hook devuelve fracción de degradación inducida
+  Dfrac <- Hook(Dmax = p$Dmax, log_DC50 = p$log_DC50, log_DCmax = p$log_DCmax, C = p$C)
+  # dP/dt = k_base - k_base * P - k_drug * Dfrac * P  (k_syn = k_base)
+  dP <- p$k_base - p$k_base * state["P"] - p$k_drug * Dfrac * state["P"]
+  list(c(dP))
+}
+
+# 6) Simulador que integra ODE para un conjunto de parámetros y devuelve P(t) vector
+simulate_Pvec <- function(param_row, times, state_init, fixed_pars) {
+  pars_all <- c(as.list(param_row),
+                C = fixed_pars$C_fixed,
+                k_base = fixed_pars$k_base,
+                k_drug = fixed_pars$k_drug)
+  out <- tryCatch({
+    sol <- ode(y = state_init, times = times, func = deSolveProtac, parms = pars_all, method = "lsoda")
+    Pvec <- sol[, "P"]
+    # aplicar P0_cor al vector observado (P_obs = P0_cor * P)
+    if (!is.null(pars_all$P0_cor)) Pvec <- pars_all$P0_cor * Pvec
+    return(as.numeric(Pvec))
+  }, error = function(e) {
+    warning("Error integrando ODE: ", conditionMessage(e))
+    return(rep(NA_real_, length(times)))
+  })
+  return(out)
+}
+
+# 7) Muestreo X1, X2 para soboljansen
+set.seed(9204)
+n <- 300   # Prueba: 300
+make_X <- function(n, mins, maxs) {
+  out <- as.data.frame(matrix(nrow = n, ncol = length(mins)))
+  colnames(out) <- names(mins)
+  for (i in seq_along(mins)) out[[i]] <- runif(n, mins[i], maxs[i])
+  return(out)
+}
+X1 <- make_X(n, binf, bsup)
+X2 <- make_X(n, binf, bsup)
+
+# 8) Crear modelo escalar por tiempo j: devuelve P(t_j) dada una fila (o matriz) de parámetros
+make_scalar_model_for_time <- function(j, times, state_init, fixed_pars) {
+  function(x) {
+    if (is.vector(x)) x <- matrix(x, nrow = 1)
+    x_df <- as.data.frame(x)
+    # Asegurar nombres correctos
+    if (!all(pars_to_vary %in% colnames(x_df))) {
+      colnames(x_df)[1:length(pars_to_vary)] <- pars_to_vary
+    }
+    res_vec <- vapply(seq_len(nrow(x_df)), function(i) {
+      params_i <- as.numeric(x_df[i, pars_to_vary])
+      names(params_i) <- pars_to_vary
+      Pvec <- simulate_Pvec(params_i, times = times, state_init = state_init, fixed_pars = fixed_pars)
+      return(Pvec[j])
+    }, numeric(1))
+    return(as.numeric(res_vec))
+  }
+}
+
+# Helper para la extracción de índices soboljansen
+extract_index_vector <- function(obj) {
+  if (is.null(dim(obj))) return(as.numeric(obj))
+  d <- dim(obj)
+  if (length(d) == 2) {
+    return(as.numeric(obj[, 1]))
+  } else if (length(d) == 3) {
+    return(as.numeric(obj[, 1, 1]))
+  } else stop("Formato inesperado en objeto de índices.")
+}
+
+# 9) Bucle por tiempos: ejecutar soboljansen y guardar S y T
+m <- length(times)
+p <- length(pars_to_vary)
+S_byT <- matrix(NA_real_, nrow = p, ncol = m, dimnames = list(pars_to_vary, paste0("t_", times)))
+T_byT <- matrix(NA_real_, nrow = p, ncol = m, dimnames = list(pars_to_vary, paste0("t_", times)))
+
+cat("Iniciando cálculo Sobol por tiempo. n =", n, "  |  tiempos:", min(times), "->", max(times), "\n")
+start_all <- proc.time()
+
+for (j in seq_along(times)) {
+  cat(sprintf("-> tiempo %d/%d (t=%g)\n", j, length(times), times[j]))
+  model_j <- make_scalar_model_for_time(j, times = times, state_init = state_init, fixed_pars = fixed_pars)
+  # Test rápido
+  test_val <- tryCatch(model_j(as.numeric(X1[1, ])), error = function(e) e)
+  if (inherits(test_val, "error")) stop("La función modelo falla en evaluación de prueba: ", conditionMessage(test_val))
+  set.seed(1000 + j)
+  sob_j <- tryCatch({
+    soboljansen(model = model_j, X1 = X1, X2 = X2, nboot = 0)
+  }, error = function(e) {
+    warning("soboljansen falló en t = ", times[j], " : ", conditionMessage(e))
+    return(NULL)
+  })
+  if (!is.null(sob_j)) {
+    S_vec <- extract_index_vector(sob_j$S)
+    T_vec <- extract_index_vector(sob_j$T)
+    # 10) Truncar negativos a cero
+    S_vec <- pmax(S_vec, 0)
+    T_vec <- pmax(T_vec, 0)
+    S_byT[, j] <- S_vec
+    T_byT[, j] <- T_vec
+  } else {
+    S_byT[, j] <- NA_real_
+    T_byT[, j] <- NA_real_
+  }
+} # Fin bucle tiempos
+
+elapsed <- proc.time() - start_all
+cat("Cálculo finalizado. Tiempo transcurrido (s):", round(elapsed["elapsed"], 1), "\n")
+
+# 11) Preparar datos largos para ggplot
+mat_to_long <- function(mat) {
+  df <- as.data.frame(mat)
+  df$Parameter <- rownames(mat)
+  df_long <- tidyr::pivot_longer(df, cols = -Parameter, names_to = "time_str", values_to = "value")
+  df_long$time <- as.numeric(sub("^t_", "", df_long$time_str))
+  df_long$time_str <- NULL
+  df_long <- df_long %>% arrange(Parameter, time)
+  return(df_long)
+}
+dfS <- mat_to_long(S_byT)
+dfT <- mat_to_long(T_byT)
+
+# 12) Graficar índices. Los valores negativos ya recortados a 0, así se dibujan como línea en el eje X
+pS <- ggplot(dfS, aes(x = time, y = value, color = Parameter)) +
+  geom_line(size = 1) + geom_point(size = 0.8) +
+  labs(x = "Tiempo (h)", y = "Índice de Sobol de Primer Orden") +
+  theme_minimal() +
+  theme(legend.position = "right") +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 10))
+
+pT <- ggplot(dfT, aes(x = time, y = value, color = Parameter)) +
+  geom_line(size = 1) + geom_point(size = 0.8) +
+  labs(x = "Tiempo (h)", y = "Índice de Sobol Total") +
+  theme_minimal() +
+  theme(legend.position = "right") +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 10))
+
+# Mostrar
+print(pS)
+print(pT)
+
+# 13) Guardar resultados
+saveRDS(list(S = S_byT, T = T_byT, times = times, params = pars_to_vary,
+             central = valores_central, fixed_pars = fixed_pars),
+        file = "sobol_time_truncated_realparams.rds")
+cat("Resultados guardados en 'sobol_time_truncated_realparams.rds'\n")
+
+# ------------------------------------------------------------
+# FIN
+# ------------------------------------------------------------
